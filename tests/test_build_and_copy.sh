@@ -191,9 +191,57 @@ test_use_wheels_uses_wheel_build() {
     setup_fixture
     run_build --use-wheels || fail "--use-wheels run failed"
     assert_log_not_contains '^docker pull eugr/spark-vllm:latest$'
+    assert_log_not_contains '^docker build --target flashinfer-export '
+    assert_log_not_contains '^docker build --target vllm-export '
     assert_log_contains '^docker build -t vllm-node '
     assert_log_contains 'NCCL_NVCC_GENCODE=-gencode=arch=compute_121,code=sm_121'
-    pass "--use-wheels preserves wheel build path with default NCCL gencode"
+    pass "--use-wheels builds only the runner from precompiled wheels"
+}
+
+test_use_wheels_never_falls_back_to_source() {
+    setup_fixture
+    rm -f "$FIXTURE_DIR/wheels/flashinfer-test.whl" "$FIXTURE_DIR/wheels/vllm-test.whl"
+    if run_build --use-wheels; then
+        fail "--use-wheels unexpectedly succeeded without precompiled wheels"
+    fi
+    assert_log_not_contains '^docker build --target flashinfer-export '
+    assert_log_not_contains '^docker build --target vllm-export '
+    assert_log_not_contains '^docker build -t vllm-node '
+    assert_output_contains 'Error: No precompiled FlashInfer wheels are available and the download failed\.'
+    assert_output_contains 'Re-run with --rebuild-flashinfer to explicitly build FlashInfer from source\.'
+    pass "--use-wheels fails instead of implicitly compiling missing wheels"
+}
+
+test_use_wheels_never_builds_missing_vllm_implicitly() {
+    setup_fixture
+    rm -f "$FIXTURE_DIR/wheels/vllm-test.whl"
+    if run_build --use-wheels; then
+        fail "--use-wheels unexpectedly succeeded without a precompiled vLLM wheel"
+    fi
+    assert_log_not_contains '^docker build --target flashinfer-export '
+    assert_log_not_contains '^docker build --target vllm-export '
+    assert_log_not_contains '^docker build -t vllm-node '
+    assert_output_contains 'Error: No precompiled vLLM wheels are available and the download failed\.'
+    assert_output_contains 'Re-run with --rebuild-vllm to explicitly build vLLM from source\.'
+    pass "--use-wheels never implicitly compiles a missing vLLM wheel"
+}
+
+test_use_wheels_builds_only_explicit_source_target() {
+    setup_fixture
+    run_build --use-wheels --rebuild-vllm || fail "--use-wheels --rebuild-vllm run failed"
+    assert_log_not_contains '^docker build --target flashinfer-export '
+    assert_log_contains '^docker build --target vllm-export '
+    assert_log_contains '^docker build -t vllm-node '
+    pass "--use-wheels compiles vLLM only when explicitly requested"
+}
+
+test_use_wheels_builds_only_explicit_flashinfer_target() {
+    setup_fixture
+    run_build --use-wheels --rebuild-flashinfer || fail "--use-wheels --rebuild-flashinfer run failed"
+    assert_log_contains '^docker build --target flashinfer-export '
+    assert_log_not_contains '^docker build --target vllm-export '
+    assert_log_contains '^docker build -t vllm-node '
+    pass "--use-wheels compiles FlashInfer only when explicitly requested"
 }
 
 test_cleanup_stays_prebuilt() {
@@ -257,17 +305,87 @@ test_build_only_flags_warn_on_prebuilt() {
     pass "build-only flags warn but do not force wheel path"
 }
 
+test_vllm_ref_skips_preset_prs_by_default() {
+    setup_fixture
+    run_build --vllm-ref ab666069935c1f23e8ef56038b4659ac9e8f19f8 || fail "--vllm-ref run failed"
+    assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=ab666069935c1f23e8ef56038b4659ac9e8f19f8 .*--build-arg VLLM_APPLY_PRESET_PRS=0'
+    assert_log_not_contains 'VLLM_APPLY_PRESET_PRS=1'
+    assert_output_contains 'Skipping preset vLLM PRs because --vllm-ref or --apply-vllm-pr was specified\.'
+    pass "--vllm-ref forwards preset PR opt-out by default"
+}
+
+test_rebuild_vllm_applies_preset_prs_by_default() {
+    setup_fixture
+    run_build --rebuild-vllm || fail "--rebuild-vllm run failed"
+    assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=main .*--build-arg VLLM_APPLY_PRESET_PRS=1'
+    assert_output_contains 'Applying preset vLLM PRs from the Dockerfile by default\.'
+    pass "ordinary main source rebuild applies preset PRs by default"
+}
+
+test_apply_vllm_pr_skips_preset_prs_by_default() {
+    setup_fixture
+    run_build --apply-vllm-pr 12345 || fail "--apply-vllm-pr run failed"
+    assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=main .*--build-arg VLLM_APPLY_PRESET_PRS=0 .*--build-arg VLLM_PRS=12345'
+    assert_output_contains 'Skipping preset vLLM PRs because --vllm-ref or --apply-vllm-pr was specified\.'
+    pass "--apply-vllm-pr suppresses preset PRs by default"
+}
+
+test_apply_vllm_pr_can_apply_preset_prs_explicitly() {
+    setup_fixture
+    run_build --apply-vllm-pr 12345 --apply-preset-vllm-prs || fail "custom and preset PR run failed"
+    assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=main .*--build-arg VLLM_APPLY_PRESET_PRS=1 .*--build-arg VLLM_PRS=12345'
+    assert_output_contains 'Applying preset vLLM PRs from the Dockerfile \(explicitly requested\)\.'
+    pass "--apply-preset-vllm-prs overrides custom PR preset suppression"
+}
+
+test_vllm_ref_can_apply_preset_prs_explicitly() {
+    setup_fixture
+    run_build --vllm-ref ab666069935c1f23e8ef56038b4659ac9e8f19f8 --apply-preset-vllm-prs || fail "--vllm-ref preset run failed"
+    assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=ab666069935c1f23e8ef56038b4659ac9e8f19f8 .*--build-arg VLLM_APPLY_PRESET_PRS=1'
+    assert_output_contains 'Applying preset vLLM PRs from the Dockerfile \(explicitly requested\)\.'
+    pass "--apply-preset-vllm-prs applies presets to selected ref"
+}
+
+test_apply_preset_prs_forces_vllm_rebuild() {
+    setup_fixture
+    run_build --apply-preset-vllm-prs || fail "--apply-preset-vllm-prs run failed"
+    assert_log_not_contains '^docker pull eugr/spark-vllm:latest$'
+    assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=main .*--build-arg VLLM_APPLY_PRESET_PRS=1'
+    assert_output_contains 'Rebuilding vLLM wheels \(\--apply-preset-vllm-prs specified\)\.\.\.'
+    pass "--apply-preset-vllm-prs forces a vLLM rebuild"
+}
+
+test_requested_vllm_prs_apply_to_selected_vllm_ref() {
+    setup_fixture
+    run_build --vllm-ref ab666069935c1f23e8ef56038b4659ac9e8f19f8 --apply-vllm-pr 12345 || fail "--apply-vllm-pr with --vllm-ref run failed"
+    assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=ab666069935c1f23e8ef56038b4659ac9e8f19f8 .*--build-arg VLLM_APPLY_PRESET_PRS=0 .*--build-arg VLLM_PRS=12345'
+    assert_output_contains 'Rebuilding vLLM wheels \(applying vLLM PRs to --vllm-ref ab666069935c1f23e8ef56038b4659ac9e8f19f8\)\.\.\.'
+    assert_output_contains 'Applying vLLM PRs: 12345'
+    pass "--apply-vllm-pr applies requested PRs to selected ref"
+}
+
 test_default_uses_prebuilt
 test_tf5_uses_prebuilt_tf5_tag
 test_custom_tag_uses_prebuilt_custom_tag
 test_default_gpu_arch_stays_prebuilt
 test_non_default_gpu_arch_uses_wheel_build
 test_use_wheels_uses_wheel_build
+test_use_wheels_never_falls_back_to_source
+test_use_wheels_never_builds_missing_vllm_implicitly
+test_use_wheels_builds_only_explicit_source_target
+test_use_wheels_builds_only_explicit_flashinfer_target
 test_cleanup_stays_prebuilt
 test_prebuilt_copy_parallel
 test_copy_skips_matching_remote_image
 test_copy_only_updates_missing_or_different_hosts
 test_no_build_skips_prebuilt
 test_build_only_flags_warn_on_prebuilt
+test_rebuild_vllm_applies_preset_prs_by_default
+test_vllm_ref_skips_preset_prs_by_default
+test_apply_vllm_pr_skips_preset_prs_by_default
+test_apply_vllm_pr_can_apply_preset_prs_explicitly
+test_vllm_ref_can_apply_preset_prs_explicitly
+test_apply_preset_prs_forces_vllm_rebuild
+test_requested_vllm_prs_apply_to_selected_vllm_ref
 
 echo "Passed $TESTS_PASSED build-and-copy tests."
