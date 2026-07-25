@@ -120,6 +120,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
         git fetch origin && \
         git fetch origin --tags --force && \
         (git checkout --detach origin/${FLASHINFER_REF} 2>/dev/null || git checkout ${FLASHINFER_REF}) && \
+        git reset --hard HEAD && \
         git submodule update --init --recursive && \
         git clean -fdx && \
         git gc --auto; \
@@ -130,41 +131,68 @@ WORKDIR /workspace/flashinfer
 
 ARG FLASHINFER_PRS=""
 
+# PR refs include the branch history they were developed on. Use upstream main
+# only to identify each PR's patch range, then apply that patch to FLASHINFER_REF.
 RUN set -eux; \
+    FLASHINFER_REQUESTED_HEAD="$(git rev-parse HEAD)"; \
     if [ -n "$FLASHINFER_PRS" ]; then \
-        # Git requires a user identity to create merge commits
+        # cp -a preserves the source repository's index stat data, but the copied
+        # files have different filesystem identities. Refresh before --index apply.
+        git update-index --refresh; \
         git config --global user.email "builder@example.com"; \
         git config --global user.name "Docker Builder"; \
         \
-        echo "Applying PRs: $FLASHINFER_PRS"; \
+        echo "Applying PR patches to FlashInfer ref $FLASHINFER_REF ($FLASHINFER_REQUESTED_HEAD): $FLASHINFER_PRS"; \
+        echo "Fetching origin/main only to calculate PR patch ranges; current checkout remains $FLASHINFER_REF."; \
+        git fetch origin +refs/heads/main:refs/remotes/origin/main; \
         for pr in $FLASHINFER_PRS; do \
-            echo "Fetching and merging PR #$pr..."; \
+            echo "Fetching PR #$pr and applying its patch onto current HEAD..."; \
             git fetch origin +pull/${pr}/head:pr-${pr}; \
-            if git merge-base --is-ancestor pr-${pr} HEAD; then \
-                echo "PR #$pr is already contained in HEAD; skipping."; \
-            else \
-                cherry_file="/tmp/pr-${pr}.cherry"; \
-                git cherry HEAD pr-${pr} > "$cherry_file"; \
-                if ! grep -q '^+' "$cherry_file"; then \
-                    echo "PR #$pr is already patch-equivalent to HEAD; skipping."; \
-                    rm -f "$cherry_file"; \
-                    continue; \
+            pr_base="$(git merge-base origin/main pr-${pr} || true)"; \
+            if [ -z "$pr_base" ]; then \
+                echo "Unable to find an origin/main merge-base for FlashInfer PR #$pr."; \
+                exit 1; \
+            fi; \
+            patch_file="/tmp/flashinfer-pr-${pr}.patch"; \
+            echo "FlashInfer PR #$pr patch range: $pr_base..pr-${pr}; apply target: $(git rev-parse HEAD)."; \
+            git diff --binary "$pr_base" "pr-${pr}" > "$patch_file"; \
+            if [ ! -s "$patch_file" ]; then \
+                echo "FlashInfer PR #$pr has no patch relative to origin/main; skipping."; \
+                rm -f "$patch_file"; \
+                continue; \
+            fi; \
+            if git apply --reverse --check --binary "$patch_file" >/dev/null 2>&1; then \
+                echo "FlashInfer PR #$pr patch is already applied to HEAD; skipping."; \
+                rm -f "$patch_file"; \
+                continue; \
+            fi; \
+            if git apply --3way --index --binary "$patch_file"; then \
+                if git diff --cached --quiet; then \
+                    echo "FlashInfer PR #$pr patch produced no staged changes; skipping."; \
+                else \
+                    git commit -m "Apply FlashInfer PR #${pr}"; \
                 fi; \
-                rm -f "$cherry_file"; \
-                git merge pr-${pr} --no-edit; \
+                rm -f "$patch_file"; \
+            else \
+                conflict_files="$(git diff --name-only --diff-filter=U)"; \
+                if [ -n "$conflict_files" ]; then \
+                    echo "FlashInfer PR #$pr has patch conflicts: $conflict_files"; \
+                else \
+                    echo "FlashInfer PR #$pr patch failed without unmerged files."; \
+                fi; \
+                rm -f "$patch_file"; \
+                git reset --hard HEAD; \
+                exit 1; \
             fi; \
         done; \
+        if ! git merge-base --is-ancestor "$FLASHINFER_REQUESTED_HEAD" HEAD; then \
+            echo "Requested FlashInfer ref $FLASHINFER_REF ($FLASHINFER_REQUESTED_HEAD) is not an ancestor of final HEAD $(git rev-parse HEAD) after PR application."; \
+            exit 1; \
+        fi; \
+        echo "Final FlashInfer source after PR application: requested $FLASHINFER_REF ($FLASHINFER_REQUESTED_HEAD), final $(git describe --tags --always --dirty)."; \
     fi
 
-# TEMPORARY patch for flashinfer autotune and other improvements (PR 2927) - MERGED 4/3
-# RUN curl -fsL https://github.com/flashinfer-ai/flashinfer/pull/2927.diff -o pr2927.diff \
-#     && if git apply --reverse --check pr2927.diff 2>/dev/null; then \
-#          echo "PR #2927 already applied, skipping."; \
-#        else \
-#          echo "Applying FI PR #2927..."; \
-#          git apply -v pr2927.diff; \
-#        fi \
-#     && rm pr2927.diff
+
 
 # Apply patch to avoid re-downloading existing cubins
 COPY flashinfer_cache.patch .
@@ -217,9 +245,10 @@ ARG CACHEBUST_VLLM=1
 # Git reference (branch, tag, or SHA) to checkout
 ARG VLLM_REF=main
 
-# DeepGEMM nv_dev includes SM120/SM121 MXFP4 support from PR #324.
+# Pinned while investigating an SM121 DeepSeek-V4 MXFP4 grouped scale-factor
+# regression first observed at nv_dev f8e8fb5 (PR #384); last known good.
 ARG DEEPGEMM_REPO=https://github.com/deepseek-ai/DeepGEMM.git
-ARG DEEPGEMM_REF=nv_dev
+ARG DEEPGEMM_REF=a6b593d2826719dcf4892609af7b84ee23aaf32a
 ENV DEEPGEMM_SRC_DIR=/workspace/DeepGEMM
 
 # Smart Git Clone (Fetch changes instead of full re-clone)
@@ -239,6 +268,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
         git fetch origin && \
         git fetch origin --tags --force && \
         (git checkout --detach origin/${VLLM_REF} 2>/dev/null || git checkout ${VLLM_REF}) && \
+        git reset --hard HEAD && \
         git submodule update --init --recursive && \
         git clean -fdx && \
         git gc --auto; \
@@ -270,8 +300,7 @@ WORKDIR $VLLM_BASE_DIR/vllm
 
 # Temporary upstream fixes carried until they are present in the pinned vLLM ref.
 # See https://github.com/vllm-project/vllm/pull/47392
-# See https://github.com/vllm-project/vllm/pull/47618
-ARG VLLM_PRESET_PRS="47392 47618"
+ARG VLLM_PRESET_PRS="47392"
 ARG VLLM_APPLY_PRESET_PRS=""
 ARG VLLM_PRS=""
 
@@ -301,6 +330,9 @@ RUN set -eux; \
         esac; \
     done; \
     if [ -n "$VLLM_ALL_PRS" ]; then \
+        # cp -a preserves the source repository's index stat data, but the copied
+        # files have different filesystem identities. Refresh before --index apply.
+        git update-index --refresh; \
         git config --global user.email "builder@example.com"; \
         git config --global user.name "Docker Builder"; \
         \
@@ -376,6 +408,55 @@ RUN set -eux; \
         fi; \
         echo "Final vLLM source after PR application: requested $VLLM_REF ($VLLM_REQUESTED_HEAD), final $(git describe --tags --always --dirty)."; \
     fi
+
+# TEMPORARY PATCH: vLLM PR #49408 / commit d6dbdb9 misplaced the XPU-only
+# return in topk_hash_softplus_sqrt, making the CUDA/ROCm kernel call dead code.
+# Remove after upstream fix PR #49452 is merged and present in the oldest
+# supported VLLM_REF. Inspect source shape rather than commit ancestry so this
+# also handles rebases, cherry-picks, and builds that already include the fix.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+target = Path("vllm/_custom_ops.py")
+function_marker = "def topk_hash_softplus_sqrt("
+direct_call = "\n    torch.ops._moe_C.topk_softplus_sqrt("
+misplaced_return = "\n\n    return" + direct_call
+fixed_return = "\n        return\n" + direct_call
+
+if not target.exists():
+    raise SystemExit(f"{target} not found; cannot inspect vLLM PR #49408 regression")
+
+text = target.read_text()
+start = text.find(function_marker)
+if start == -1:
+    print("topk_hash_softplus_sqrt is absent; vLLM PR #49408 is not applicable")
+else:
+    end = text.find("\ndef ", start + len(function_marker))
+    end = len(text) if end == -1 else end
+    function = text[start:end]
+
+    if "is_padding" not in function:
+        print("topk_hash_softplus_sqrt predates vLLM PR #49408; skipping workaround")
+    elif fixed_return in function:
+        print("vLLM topk_softplus_sqrt non-XPU path already fixed; skipping")
+    elif (
+        direct_call in function
+        and "current_platform.is_xpu()" not in function
+        and "\n    return" not in function
+    ):
+        print("topk_hash_softplus_sqrt has no XPU workaround; patch is not applicable")
+    elif function.count(misplaced_return) == 1:
+        function = function.replace(misplaced_return, fixed_return, 1)
+        updated = text[:start] + function + text[end:]
+        compile(updated, str(target), "exec")
+        target.write_text(updated)
+        print("Applied vLLM PR #49452 topk_softplus_sqrt control-flow fix")
+    else:
+        raise SystemExit(
+            "Unknown is_padding-aware topk_hash_softplus_sqrt layout; "
+            "refusing to guess whether vLLM PR #49408 is fixed"
+        )
+PY
 
 # TEMPORARY PATCH: vLLM PR #47914 added per-KV-group causal metadata by
 # treating non-bool causal as Mapping[int, bool]. DiffusionGemma passes a
