@@ -62,6 +62,8 @@ python -m pip install PyYAML
 - `build-and-copy.sh`: image selection, building, and distribution
 - `hf-download.sh`: Hugging Face download and model distribution
 - `autodiscover.sh`: host and network topology discovery
+- `setup-cluster.sh` / `setup-cluster.py` / `setup_cluster_node.py`: reversible
+  CX7 and SSH setup; use mocked tests during development, never a real setup
 - `mods/`: patches or files applied inside launched containers
 - `tests/`: mocked integration and focused behavior tests
 
@@ -135,6 +137,8 @@ For recipe or runner changes, run the CI-equivalent checks:
 ./tests/test_recipes.sh -v
 ./tests/test_launch_cluster_image_sync.sh
 ./tests/test_launch_cluster_vllm_pr.sh
+./tests/test_launch_cluster_earlyoom.sh
+python3 tests/test_launch_cluster_networking.py
 ```
 
 Then dry-run every changed recipe, including nested recipes, with an explicit
@@ -151,6 +155,9 @@ python3 tests/test_vllm_flashinfer_b12x_patch.py
 
 # shell syntax for an edited script
 bash -n path/to/script.sh
+
+# cluster setup and restore (no live nodes or sudo)
+python3 tests/test_setup_cluster.py
 ```
 
 Some mods have dedicated `tests/test_*_mod.sh` scripts. Run the matching test
@@ -163,6 +170,9 @@ real deployment for them.
   expansions, and use arrays for commands rather than assembling shell strings.
 - Python supports 3.10+. Prefer `pathlib.Path`, argument lists for subprocesses,
   and existing helpers in `run-recipe.py`.
+- Apply built-in vLLM fixes to source before building the wheel. Wheels are
+  released alongside the Docker image and already contain those fixes; do not
+  add runner-stage patching or compatibility paths for unpatched vLLM wheels.
 - Keep mods targeted and repeatable. Mods are always applied at runtime to a
   freshly created vLLM container; there is no supported workflow where a new
   mod version is applied over a container patched by an older version. Do not
